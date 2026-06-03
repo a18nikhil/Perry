@@ -1,3 +1,5 @@
+pip install yfinance pandas
+
 import os, logging, yfinance as yf, pandas as pd
 from datetime import timedelta
 
