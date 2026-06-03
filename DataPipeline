@@ -1,0 +1,424 @@
+import os, logging, yfinance as yf, pandas as pd
+from datetime import timedelta
+
+pd.options.display.float_format = "{:.2f}".format
+
+BASE_DIR = os.path.abspath(".")
+DATA_DIR = os.path.join(BASE_DIR, "data")
+TIMEZONE = "Asia/Kolkata"
+AUTO_ADJUST = False
+
+PERIOD_MAP = {
+    "1m":"7d","2m":"60d","5m":"60d","15m":"60d","30m":"60d",
+    "60m":"730d","90m":"60d","1d":"max","5d":"max",
+    "1wk":"max","1mo":"max","3mo":"max"
+}
+
+INTERVALS = [
+    "1m","2m","5m","15m","30m","60m",
+    "90m","1d","5d","1wk","1mo","3mo"
+]
+
+STOCKS = {
+    "GSFC":"GSFC.NS",
+    "RELIANCE":"RELIANCE.NS",
+    "COFFEEDAY":"COFFEEDAY.NS",
+    "TRIDENT":"TRIDENT.NS",
+    "ITC":"ITC.NS"
+}
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+def show_df(df, rows=20):
+    try:
+        from IPython.display import display
+        display(df)
+    except:
+        print(df.tail(rows))
+
+class CSVStorage:
+
+    @staticmethod
+    def get_path(ticker, interval):
+        folder = os.path.join(DATA_DIR, ticker)
+        os.makedirs(folder, exist_ok=True)
+        return os.path.join(folder, f"{ticker}_{interval}.csv")
+
+    @staticmethod
+    def load(path):
+        if not os.path.exists(path):
+            return pd.DataFrame()
+
+        df = pd.read_csv(path)
+
+        if "Datetime" in df.columns:
+            df["Datetime"] = pd.to_datetime(
+                df["Datetime"],
+                errors="coerce"
+            )
+
+        return df.dropna(subset=["Datetime"])
+
+    @staticmethod
+    def save(df, path):
+        temp = path.replace(".csv", "_temp.csv")
+
+        df.to_csv(
+            temp,
+            index=False,
+            float_format="%.2f"
+        )
+
+        os.replace(temp, path)
+
+def fetch_market_data(
+    ticker,
+    interval,
+    start_date=None,
+    end_date=None,
+    period=None
+):
+
+    df = yf.download(
+        tickers=ticker,
+        interval=interval,
+        start=start_date,
+        end=end_date,
+        period=period,
+        auto_adjust=AUTO_ADJUST,
+        progress=False
+    )
+
+    if df.empty:
+        return pd.DataFrame()
+
+    df = df.reset_index()
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    if "Datetime" not in df.columns:
+        df = df.rename(columns={"Date":"Datetime"})
+
+    df["Datetime"] = pd.to_datetime(
+        df["Datetime"],
+        utc=True,
+        errors="coerce"
+    )
+
+    df = df.dropna(subset=["Datetime"])
+
+    df["Datetime"] = (
+        df["Datetime"]
+        .dt.tz_convert(TIMEZONE)
+    )
+
+    keep = [
+        "Datetime",
+        "Open",
+        "High",
+        "Low",
+        "Close",
+        "Volume"
+    ]
+
+    df = df[keep]
+
+    price_cols = [
+        "Open",
+        "High",
+        "Low",
+        "Close"
+    ]
+
+    df[price_cols] = df[price_cols].round(2)
+
+    df["body_mid"] = (
+        (df["Open"] + df["Close"]) / 2
+    ).round(2)
+
+    return df
+
+def update_dataset(old_df, new_df):
+
+    if old_df.empty:
+        combined = new_df.copy()
+    else:
+        combined = pd.concat(
+            [old_df, new_df],
+            ignore_index=True
+        )
+
+    combined["Datetime"] = pd.to_datetime(
+        combined["Datetime"],
+        errors="coerce"
+    )
+
+    combined = (
+        combined
+        .dropna(subset=["Datetime"])
+        .drop_duplicates(
+            subset=["Datetime"],
+            keep="last"
+        )
+        .sort_values("Datetime")
+        .reset_index(drop=True)
+    )
+
+    return combined
+def get_market_data(
+    ticker,
+    interval,
+    start_date=None,
+    end_date=None
+):
+
+    path = CSVStorage.get_path(
+        ticker,
+        interval
+    )
+
+    df = CSVStorage.load(path)
+
+    if df.empty:
+        return df
+
+    if start_date is not None:
+        df = df[
+            df["Datetime"] >= pd.to_datetime(start_date)
+        ]
+
+    if end_date is not None:
+        df = df[
+            df["Datetime"] <= pd.to_datetime(end_date)
+        ]
+
+    return df.reset_index(drop=True)
+
+def run_pipeline(
+    name,
+    ticker,
+    interval
+):
+
+    path = CSVStorage.get_path(
+        ticker,
+        interval
+    )
+
+    existing_df = CSVStorage.load(path)
+
+    if existing_df.empty:
+
+        new_df = fetch_market_data(
+            ticker=ticker,
+            interval=interval,
+            period=PERIOD_MAP.get(
+                interval,
+                "max"
+            )
+        )
+
+    else:
+
+        last_time = (
+            existing_df["Datetime"]
+            .max()
+        )
+
+        buffer_map = {
+            "1m":1,
+            "2m":2,
+            "5m":5,
+            "15m":15,
+            "30m":30,
+            "60m":60,
+            "90m":90
+        }
+
+        safe_start = (
+            last_time -
+            timedelta(
+                minutes=buffer_map.get(
+                    interval,
+                    1440
+                )
+            )
+        )
+
+        new_df = fetch_market_data(
+            ticker=ticker,
+            interval=interval,
+            start_date=safe_start
+        )
+
+    if new_df.empty:
+
+        logging.info(
+            f"{name} | {interval} | No new data"
+        )
+
+        return
+
+    updated_df = update_dataset(
+        existing_df,
+        new_df
+    )
+
+    CSVStorage.save(
+        updated_df,
+        path
+    )
+
+    logging.info(
+        f"{name} | {interval} | Rows={len(updated_df)}"
+    )
+
+    print(
+        f"\n{name} | {interval}"
+    )
+
+    print(
+        f"Rows : {len(updated_df)}"
+    )
+
+    print(
+        f"Saved : {path}"
+    )
+
+    show_df(updated_df)
+
+def select_stock():
+
+    search = input(
+        "\nSearch Stock: "
+    ).strip().upper()
+
+    matches = [
+        name
+        for name in STOCKS
+        if search in name
+    ]
+
+    if not matches:
+        print(
+            "\nNo matching stocks found."
+        )
+        return None, None
+
+    print("\nMatching Stocks:\n")
+
+    for i, stock in enumerate(
+        matches,
+        start=1
+    ):
+        print(f"{i}. {stock}")
+
+    try:
+
+        choice = int(
+            input(
+                "\nSelect Stock Number: "
+            )
+        )
+
+        stock = matches[
+            choice - 1
+        ]
+
+        return (
+            stock,
+            STOCKS[stock]
+        )
+
+    except:
+        print(
+            "\nInvalid selection."
+        )
+        return None, None
+
+def select_intervals():
+
+    print(
+        "\nAvailable Intervals:\n"
+    )
+
+    for i, interval in enumerate(
+        INTERVALS,
+        start=1
+    ):
+        print(
+            f"{i}. {interval}"
+        )
+
+    print(
+        "\nExample: 1 3 8"
+    )
+
+    raw = input(
+        "\nSelect Intervals: "
+    ).strip()
+
+    selected = []
+
+    for item in raw.split():
+
+        if not item.isdigit():
+            continue
+
+        idx = int(item)
+
+        if (
+            1 <= idx <=
+            len(INTERVALS)
+        ):
+            selected.append(
+                INTERVALS[idx - 1]
+            )
+
+    return selected
+
+def main():
+
+    stock_name, ticker = (
+        select_stock()
+    )
+
+    if not ticker:
+        return
+
+    intervals = (
+        select_intervals()
+    )
+
+    if not intervals:
+
+        print(
+            "\nNo valid intervals selected."
+        )
+
+        return
+
+    for interval in intervals:
+
+        try:
+
+            run_pipeline(
+                name=stock_name,
+                ticker=ticker,
+                interval=interval
+            )
+
+        except Exception as e:
+
+            logging.exception(
+                f"{stock_name} | "
+                f"{interval} | "
+                f"{e}"
+            )
+
+if __name__ == "__main__":
+    main()
